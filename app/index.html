@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>学习路径引擎 · 半导体论文</title>
+  <link rel="stylesheet" href="css/style.css">
+  <!-- 两个第三方库都走 CDN，不需要 npm、不需要打包 -->
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://unpkg.com/vis-network@9/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+  <!--
+    ============================================================
+    index.html —— 界面骨架（只管「长什么样」，不管「怎么算」）
+
+    想改行为，去这些地方：
+      · 阈值 / 开关 / 推荐类别      → js/config.js
+      · 学习路径怎么自动生成        → js/pathgen.js
+      · 相关文献怎么抓、推荐理由    → js/literature.js
+      · DOI 导入的流水线            → js/autogen.js
+      · 论文库 / 评分存在哪         → js/store.js
+      · 界面状态机（点按钮做什么）  → js/app.js
+      · 论文题录 + 判据 + 练习任务  → data/papers.js
+      · 知识点内容（两个领域池）    → data/nodes-ic-device.js
+                                       data/nodes-power-wbg.js
+      · 颜色 / 间距                 → css/style.css
+
+    脚本加载顺序有依赖，别随便调换：
+      config → 数据 → 各模块 → app.js
+    ============================================================
+  -->
+  <div id="app">
+
+    <!-- ===== 加载态：还没算出当前论文的显示内容 ===== -->
+    <div v-if="!view" class="loading-state">
+      <div class="loading-spinner"></div>
+      <p>正在生成学习路径…</p>
+    </div>
+
+    <template v-else>
+
+    <!-- ===== 顶部栏 ===== -->
+    <header class="header">
+      <div class="header-left">
+        <h1>学习路径引擎</h1>
+
+        <!-- 论文库选择器：固化论文 + 自己导入的论文 -->
+        <div class="paper-picker">
+          <select class="paper-select" :value="currentId"
+                  @change="selectPaper($event.target.value)">
+            <option v-for="p in papers" :key="p.instance_id" :value="p.instance_id">
+              {{ p.short_title || p.title }}
+            </option>
+          </select>
+          <!-- 只有自己导入的论文能删，固化论文写在 data/papers.js 里 -->
+          <button v-if="currentPaper.source === 'imported'"
+                  class="btn btn-ghost btn-sm"
+                  @click="removePaper(currentId)">删除</button>
+        </div>
+
+        <button class="btn btn-primary btn-sm" @click="showImport = !showImport">
+          {{ showImport ? '收起导入' : '＋ 用 DOI 导入' }}
+        </button>
+      </div>
+
+      <div class="header-right">
+        <div class="progress-ring" :title="'路径完成度 ' + overallProgress + '%'">
+          <svg viewBox="0 0 36 36">
+            <path class="ring-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+            <path class="ring-fg" :stroke-dasharray="`${overallProgress}, 100`" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>
+          </svg>
+          <span class="ring-text">{{ overallProgress }}%</span>
+        </div>
+        <div class="goal-info">
+          <div class="goal-title">当前论文</div>
+          <div class="goal-name">{{ currentPaper.short_title || currentPaper.title }}</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" @click="openExport('ai')">导出给 AI 改写</button>
+      </div>
+    </header>
+
+    <!-- ===== DOI 导入面板（点顶部按钮展开）===== -->
+    <section class="import-panel" v-if="showImport">
+      <div class="import-head">
+        <h2>用 DOI 导入一篇论文</h2>
+        <button class="close-btn" @click="showImport = false">×</button>
+      </div>
+      <p class="import-hint">
+        填 DOI（例如 <code>10.1109/tpel.2024.3522297</code>），app 会依次做四件事：
+        ① 从 Crossref + OpenAlex 抓题录、作者、机构、摘要、主题词；
+        ② 判断这篇论文属于哪个领域节点池；
+        ③ 从节点池里自动选出它需要的知识点，算出主轴、分支与学习顺序；
+        ④ 检索五类相关文献。
+      </p>
+      <div class="import-row">
+        <input class="import-input" v-model="importState.doi"
+               placeholder="10.xxxx/xxxxx" spellcheck="false"
+               :disabled="importState.busy" @keyup.enter="doImport">
+        <button class="btn btn-primary" @click="doImport" :disabled="importState.busy">
+          {{ importState.busy ? '生成中…' : '生成学习路径' }}
+        </button>
+      </div>
+      <div class="busy-box" v-if="importState.busy">
+        <div class="loading-spinner"></div>
+        <p>{{ importState.stage || '正在处理…' }}</p>
+      </div>
+      <div class="import-note">
+        <strong>导入能自动做什么、不能做什么：</strong>
+        知识点的说明、掌握标准、学习资源来自人工/AI 撰写的节点池，导入时不会新写；
+        判据（Rubric）文字与练习任务只能给通用模板，因为这两样需要论文正文里的真实数字。
+        想改成这篇论文专属的，点右上「导出给 AI 改写」，把骨架贴给 AI 让它填。
+      </div>
+    </section>
+
+    <!-- ===== 全局提示条 ===== -->
+    <div class="alert alert-error" v-if="importState.error">
+      {{ importState.error }}
+      <button class="alert-close" @click="importState.error = ''">×</button>
+    </div>
+    <div class="alert alert-ok" v-if="importState.ok">
+      {{ importState.ok }}
+      <button class="alert-close" @click="importState.ok = ''">×</button>
+    </div>
+
+    <!-- ===== 主体区域 ===== -->
+    <main class="main">
+
+      <!-- 左侧：知识图谱 -->
+      <section class="graph-panel">
+        <div class="panel-toolbar">
+          <button :class="{active: filterLayer === '全部'}" @click="filterLayer = '全部'">全部</button>
+          <!-- 只显示当前这张图里真实存在的层 -->
+          <button v-for="L in availableLayers" :key="L"
+                  :class="{active: filterLayer === L}" @click="filterLayer = L">{{ L }}</button>
+          <span class="separator"></span>
+          <button :class="{active: showPath}" @click="showPath = !showPath">高亮学习路径</button>
+          <!-- 自动生成模式下，把没被选中的候选节点也画出来做对比 -->
+          <button v-if="displayView.mode === 'auto'"
+                  :class="{active: showUnselected}"
+                  @click="showUnselected = !showUnselected"
+                  title="把候选池里没被这篇论文选中的节点也画出来，看看算法漏了什么">显示未选中的节点</button>
+        </div>
+
+        <div class="graph-body">
+          <div id="graph-container" ref="graphContainer"></div>
+        </div>
+
+        <div class="legend">
+          <!-- 人工策划模式：主轴 / 分支 -->
+          <template v-if="displayView.mode === 'curated'">
+            <span class="legend-item"><i class="dot dot-spine"></i>主轴节点</span>
+            <span class="legend-item"><i class="dot dot-branch"></i>分支节点</span>
+            <span class="legend-item"><i class="dot dot-other"></i>池内其它节点</span>
+          </template>
+          <!-- 自动生成模式：核心 / 前置 / 延伸 -->
+          <template v-else>
+            <span class="legend-item"><i class="dot dot-seed"></i>核心（论文直接考）</span>
+            <span class="legend-item"><i class="dot dot-prereq"></i>前置（学核心必须先会）</span>
+            <span class="legend-item"><i class="dot dot-frontier"></i>延伸（往外一跳，L4 用）</span>
+            <span class="legend-item" v-if="showUnselected"><i class="dot dot-unselected"></i>未被选中</span>
+          </template>
+          <span class="legend-item"><i class="line line-hard"></i>硬依赖（不可跳过）</span>
+          <span class="legend-item"><i class="line line-soft"></i>软依赖（可跳过）</span>
+          <span class="legend-hint">拖拽平移 · 滚轮缩放 · 点击节点看详情并打分</span>
+        </div>
+      </section>
+
+      <!-- 右侧：三页签面板 -->
+      <aside class="detail-panel">
+        <div class="tabs">
+          <button :class="{active: activeTab === 'paper'}" @click="activeTab = 'paper'">论文与路径</button>
+          <button :class="{active: activeTab === 'node'}" @click="activeTab = 'node'">
+            节点详情<span class="tab-dot" v-if="selectedNode"></span>
+          </button>
+          <button :class="{active: activeTab === 'lit'}" @click="activeTab = 'lit'">
+            相关文献
+            <span class="tab-count" v-if="litState.data">{{ litState.data.total }}</span>
+          </button>
+        </div>
+
+        <!-- ============ 页签 1：论文与路径 ============ -->
+        <div class="tab-body" v-show="activeTab === 'paper'">
+
+          <!-- 论文题录 -->
+          <div class="paper-card">
+            <div class="badge-row">
+              <span class="badge" :class="currentPaper.path_source === 'curated' ? 'badge-curated' : 'badge-auto'">
+                {{ currentPaper.path_source === 'curated' ? CFG.text.curatedBadge : CFG.text.autoBadge }}
+              </span>
+              <span class="badge badge-tier" v-if="currentPaper.difficulty_tier">
+                难度 T{{ currentPaper.difficulty_tier }}
+              </span>
+              <span class="badge badge-pool" v-for="n in displayView.poolNames" :key="n">{{ n }}</span>
+            </div>
+
+            <h2 class="paper-title">
+              <a v-if="currentPaper.url" :href="currentPaper.url"
+                 target="_blank" rel="noopener noreferrer">{{ currentPaper.title }} ↗</a>
+              <template v-else>{{ currentPaper.title }}</template>
+            </h2>
+
+            <div class="paper-meta">
+              <span v-if="currentPaper.journal">{{ currentPaper.journal }}</span>
+              <span v-if="currentPaper.year">{{ currentPaper.year }}</span>
+              <span v-if="currentPaper.volume">
+                vol.{{ currentPaper.volume }}<template v-if="currentPaper.issue">({{ currentPaper.issue }})</template>
+              </span>
+              <span v-if="currentPaper.pages">{{ currentPaper.pages }}</span>
+              <span v-if="currentPaper.cited_by_count !== undefined">被引 {{ currentPaper.cited_by_count }}</span>
+              <span v-if="currentPaper.doi" class="paper-doi">DOI: {{ currentPaper.doi }}</span>
+            </div>
+
+            <div class="paper-authors" v-if="currentPaper.authors && currentPaper.authors.length">
+              <span v-for="(a, i) in currentPaper.authors" :key="a.name + i" class="author-chip">
+                {{ a.name }}<i v-if="a.orcid" class="author-orcid" :title="'ORCID: ' + a.orcid">◎</i>
+              </span>
+            </div>
+            <div class="paper-inst" v-if="currentPaper.institutions && currentPaper.institutions.length">
+              {{ currentPaper.institutions.map(x => x.name).join('、') }}
+            </div>
+
+            <p class="paper-note" v-if="currentPaper.note">{{ currentPaper.note }}</p>
+          </div>
+
+          <!-- 摘要 -->
+          <div class="detail-section" v-if="currentPaper.abstract">
+            <h3>摘要</h3>
+            <div class="warn-box" v-if="currentPaper.abstract_quality === 'reconstructed'">
+              这段摘要由 OpenAlex 的倒排索引还原：下标与公式处的空格会丢失
+              （例如 <code>Ga2O3planar gatemosfets</code>），中间可能有一小段没还原出来。
+              <strong>引用数字请以 DOI 原文为准。</strong>
+            </div>
+            <p class="abstract-text">{{ currentPaper.abstract }}</p>
+          </div>
+
+          <!-- 路径概览 -->
+          <div class="detail-section">
+            <h3>学习路径</h3>
+            <div class="stat-row">
+              <div class="stat">
+                <div class="stat-num">{{ displayView.summary.seedCount }}</div>
+                <div class="stat-label">{{ displayView.mode === 'curated' ? '主轴+分支' : '核心节点' }}</div>
+              </div>
+              <div class="stat">
+                <div class="stat-num">{{ displayView.summary.prereqCount }}</div>
+                <div class="stat-label">{{ displayView.mode === 'curated' ? '池内其它' : '前置节点' }}</div>
+              </div>
+              <div class="stat" v-if="displayView.mode === 'auto'">
+                <div class="stat-num">{{ displayView.summary.frontierCount }}</div>
+                <div class="stat-label">延伸节点</div>
+              </div>
+              <div class="stat">
+                <div class="stat-num">{{ displayView.summary.edgeCount }}</div>
+                <div class="stat-label">依赖关系</div>
+              </div>
+            </div>
+
+            <div class="warn-box" v-if="displayView.mode === 'auto' && !displayView.summary.hasAbstract">
+              没抓到摘要，自动路径只能靠标题和主题词来选，质量会明显下降。
+              建议在 <code>data/papers.js</code> 里补上 abstract，或用 focus_nodes 手工指定节点。
+            </div>
+
+            <!-- 主轴：所有人都一样，按顺序学 -->
+            <div class="path-block">
+              <div class="path-block-title">
+                主轴（{{ displayView.path_graph.spine.length }} 个）
+                <span class="path-block-sub">这个领域的基础链条，顺序不能乱</span>
+              </div>
+              <ol class="path-list">
+                <li v-for="id in displayView.path_graph.spine" :key="id" @click="selectNodeById(id)">
+                  <span class="path-name">{{ getNodeName(id) }}</span>
+                  <i class="prereq-score" :class="scoreClass(getScore(id))">{{ getScore(id) }}</i>
+                </li>
+              </ol>
+            </div>
+
+            <!-- 分支：这篇论文特有的知识点（延伸节点已剔除，单独列在下面） -->
+            <div class="path-block" v-for="(ids, bi) in branchBlocks" :key="bi">
+              <div class="path-block-title">
+                分支（{{ ids.length }} 个）
+                <span class="path-block-sub">这篇论文直接考的内容</span>
+              </div>
+              <ul class="path-list">
+                <li v-for="id in ids" :key="id" @click="selectNodeById(id)">
+                  <span class="path-name">{{ getNodeName(id) }}</span>
+                  <i class="prereq-score" :class="scoreClass(getScore(id))">{{ getScore(id) }}</i>
+                </li>
+              </ul>
+            </div>
+
+            <!-- 延伸节点：往外一跳，L4「推进」级练习的入口 -->
+            <div class="path-block" v-if="frontierNodes.length">
+              <div class="path-block-title">
+                延伸（{{ frontierNodes.length }} 个）
+                <span class="path-block-sub">论文没直接考，但是「下一步能做什么」的方向</span>
+              </div>
+              <div class="chip-row">
+                <span class="chip chip-node chip-frontier" v-for="n in frontierNodes" :key="n.node_id"
+                      @click="selectNodeById(n.node_id)">{{ n.name }}</span>
+              </div>
+            </div>
+
+            <!-- 背景前置：路径要用，但四级判据没直接考 -->
+            <div class="path-block" v-if="displayView.implied && displayView.implied.length">
+              <div class="path-block-title">
+                背景前置（{{ displayView.implied.length }} 个）
+                <span class="path-block-sub">算在路径里，但判据没直接考到</span>
+              </div>
+              <div class="chip-row">
+                <span class="chip chip-node" v-for="id in displayView.implied" :key="id"
+                      @click="selectNodeById(id)">
+                  {{ getNodeName(id) }}
+                  <i class="prereq-score" :class="scoreClass(getScore(id))">{{ getScore(id) }}</i>
+                </span>
+              </div>
+            </div>
+
+            <!-- 人工策划模式下，池里没进路径的节点也列出来 -->
+            <div class="path-block" v-if="displayView.mode === 'curated'">
+              <div class="path-block-title">
+                池内其它节点
+                <span class="path-block-sub">这篇论文没要求，同领域可以顺带看</span>
+              </div>
+              <div class="chip-row">
+                <span class="chip chip-node" v-for="n in displayView.nodes" :key="n.node_id"
+                      v-show="displayView.roleOf[n.node_id] === 'other'"
+                      @click="selectNodeById(n.node_id)">{{ n.name }}</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 各层进度 -->
+          <div class="detail-section">
+            <h3>各层掌握进度</h3>
+            <div class="layer-progress" v-for="layer in layerProgress" :key="layer.name">
+              <div class="layer-name">{{ layer.name }}<i class="layer-count">{{ layer.count }}</i></div>
+              <div class="layer-bar"><div class="layer-fill" :style="{width: layer.percent + '%'}"></div></div>
+              <div class="layer-percent">{{ layer.percent }}%</div>
+            </div>
+          </div>
+
+          <!-- 判据就绪度 -->
+          <div class="detail-section">
+            <h3>
+              四级判据就绪度
+              <span class="badge badge-curated" v-if="displayView.rubric.source === 'curated'">人工撰写</span>
+              <span class="badge badge-auto" v-else>节点足迹自动填</span>
+            </h3>
+            <div class="readiness">
+              <div class="readiness-item" v-for="rl in rubricReadiness" :key="rl.level">
+                <div class="readiness-line">
+                  <span class="readiness-level">L{{ rl.level }} {{ rl.name }}</span>
+                  <span class="readiness-status" :class="rl.ready ? 'ready' : 'not-ready'">
+                    {{ rl.ready ? '✓ 可尝试' : '✗ 需补强' }}
+                  </span>
+                </div>
+                <p class="readiness-evidence">{{ rl.evidence }}</p>
+                <div class="readiness-detail">{{ rl.detail }}</div>
+                <div class="chip-row" v-if="rl.uses_nodes.length">
+                  <span class="chip chip-node" v-for="id in rl.uses_nodes" :key="id"
+                        @click="selectNodeById(id)">
+                    {{ getNodeName(id) }}
+                    <i class="prereq-score" :class="scoreClass(getScore(id))">{{ getScore(id) }}</i>
+                  </span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 练习任务 -->
+          <div class="detail-section" v-if="displayView.practice_tasks.length">
+            <h3>练习任务</h3>
+            <div class="task-card" v-for="task in displayView.practice_tasks" :key="task.task_id">
+              <div class="task-header">
+                <span class="task-level">L{{ task.level }}</span>
+                <span class="task-title">{{ task.title }}</span>
+              </div>
+              <p class="task-instructions">{{ task.instructions }}</p>
+              <p class="task-criteria"><strong>通过标准：</strong>{{ task.success_criteria }}</p>
+              <div class="chip-row" v-if="task.targets && task.targets.length">
+                <span class="chip chip-node" v-for="id in task.targets" :key="id"
+                      @click="selectNodeById(id)">{{ getNodeName(id) }}</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============ 页签 2：节点详情 ============ -->
+        <div class="tab-body" v-show="activeTab === 'node'">
+
+          <!-- 空状态：还没点节点 -->
+          <div class="empty-state" v-if="!selectedNode">
+            <div class="empty-icon">🎯</div>
+            <h2>点击图谱中的节点</h2>
+            <p>查看概念说明、学习资源、练习任务</p>
+            <p>并为自己的掌握程度打分</p>
+          </div>
+
+          <template v-else>
+            <div class="detail-header">
+              <h2>{{ selectedNode.name }}</h2>
+              <button class="close-btn" @click="selectedNode = null">×</button>
+            </div>
+            <div class="detail-meta">
+              <span class="tag tag-layer">{{ selectedNode.layer }}</span>
+              <span class="tag tag-kind">{{ kindLabel(selectedNode.kind) }}</span>
+              <span class="tag tag-role" v-if="roleLabel(selectedNode.node_id)">{{ roleLabel(selectedNode.node_id) }}</span>
+              <span class="tag tag-path" v-if="isInPath(selectedNode.node_id)">在学习路径上</span>
+            </div>
+
+            <!-- 自评分 -->
+            <div class="score-section">
+              <div class="score-header">
+                <span>掌握程度自评</span>
+                <span class="score-value">{{ getScore(selectedNode.node_id) }}/10</span>
+              </div>
+              <input type="range" min="0" max="10" step="1" class="score-slider"
+                     :value="getScore(selectedNode.node_id)"
+                     @input="setScore(selectedNode.node_id, +$event.target.value)">
+              <div class="score-labels">
+                <span>未接触</span><span>初步了解</span><span>基本掌握</span><span>精通</span>
+              </div>
+            </div>
+
+            <!-- 概念说明 -->
+            <div class="detail-section">
+              <h3>概念说明</h3>
+              <div class="diagram-box" v-if="getDiagram(selectedNode.node_id)"
+                   v-html="getDiagram(selectedNode.node_id)"></div>
+              <p class="description">{{ selectedNode.description }}</p>
+            </div>
+
+            <!-- 掌握标准 -->
+            <div class="detail-section">
+              <h3>掌握标准</h3>
+              <p class="evidence">{{ selectedNode.evidence_of_mastery }}</p>
+            </div>
+
+            <!-- 自动匹配诊断：解释「为什么这个节点进了这篇论文的路径」 -->
+            <div class="detail-section" v-if="nodeDiag">
+              <h3>为什么它进了这篇论文的路径</h3>
+              <div class="diag">
+                <div class="diag-row">
+                  <span class="diag-k">匹配得分</span>
+                  <span class="diag-v"><strong>{{ nodeDiag.score }}</strong>（门槛 {{ CFG.match.minSeedScore }}）</span>
+                </div>
+                <div class="diag-row" v-if="nodeDiag.hitTitle.length">
+                  <span class="diag-k">命中标题</span>
+                  <span class="diag-v diag-hit">{{ nodeDiag.hitTitle.join('、') }}</span>
+                </div>
+                <div class="diag-row" v-if="nodeDiag.hitTopic.length">
+                  <span class="diag-k">命中主题词</span>
+                  <span class="diag-v diag-hit">{{ nodeDiag.hitTopic.join('、') }}</span>
+                </div>
+                <div class="diag-row" v-if="nodeDiag.hitAbstract.length">
+                  <span class="diag-k">命中摘要</span>
+                  <span class="diag-v diag-hit">{{ nodeDiag.hitAbstract.join('、') }}</span>
+                </div>
+                <div class="diag-row" v-if="!nodeDiag.hitTitle.length && !nodeDiag.hitTopic.length && !nodeDiag.hitAbstract.length">
+                  <span class="diag-k">命中情况</span>
+                  <span class="diag-v">没匹配上论文文字，它是作为前置或延伸被依赖关系带进来的</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 学习资源 -->
+            <div class="detail-section" v-if="selectedNode.resources && selectedNode.resources.length">
+              <h3>学习资源（点击直达）</h3>
+              <ul class="resource-list">
+                <li v-for="r in selectedNode.resources" :key="r.title">
+                  <a class="resource-link" :href="urlForResource(selectedNode.node_id, r)"
+                     target="_blank" rel="noopener noreferrer">
+                    <span class="resource-type">{{ r.type }}</span>
+                    <div class="resource-info">
+                      <div class="resource-title">{{ r.title }} <span class="ext-icon">↗</span></div>
+                      <div class="resource-note">{{ r.note }}</div>
+                    </div>
+                  </a>
+                </li>
+              </ul>
+            </div>
+
+            <!-- 前置知识：灰底表示这个前置不在当前这张图里 -->
+            <div class="detail-section" v-if="selectedNode.prerequisites && selectedNode.prerequisites.length">
+              <h3>前置知识</h3>
+              <div class="chip-row">
+                <span class="prereq-tag" :class="{'prereq-out': !inGraph(pid)}"
+                      v-for="pid in selectedNode.prerequisites" :key="pid"
+                      @click="selectNodeById(pid)">
+                  {{ getNodeName(pid) }}
+                  <i class="prereq-score" :class="scoreClass(getScore(pid))">{{ getScore(pid) }}</i>
+                </span>
+              </div>
+            </div>
+
+            <!-- 后继节点 -->
+            <div class="detail-section" v-if="nextNodes(selectedNode.node_id).length">
+              <h3>学完它能去哪</h3>
+              <div class="chip-row">
+                <span class="prereq-tag" v-for="nx in nextNodes(selectedNode.node_id)"
+                      :key="nx.id" :title="nx.reason" @click="selectNodeById(nx.id)">
+                  {{ getNodeName(nx.id) }}
+                  <i class="edge-tag" :class="nx.type === 'hard' ? 'edge-hard' : 'edge-soft'">
+                    {{ nx.type === 'hard' ? '硬' : '软' }}
+                  </i>
+                </span>
+              </div>
+            </div>
+
+            <!-- 相关练习 -->
+            <div class="detail-section" v-if="getNodeTasks(selectedNode.node_id).length">
+              <h3>相关练习任务</h3>
+              <div class="task-card" v-for="task in getNodeTasks(selectedNode.node_id)" :key="task.task_id">
+                <div class="task-header">
+                  <span class="task-level">L{{ task.level }}</span>
+                  <span class="task-title">{{ task.title }}</span>
+                </div>
+                <p class="task-instructions">{{ task.instructions }}</p>
+                <p class="task-criteria"><strong>通过标准：</strong>{{ task.success_criteria }}</p>
+              </div>
+            </div>
+          </template>
+        </div>
+
+        <!-- ============ 页签 3：相关文献 ============ -->
+        <div class="tab-body" v-show="activeTab === 'lit'">
+          <div class="lit-toolbar">
+            <button class="btn btn-sm" @click="ensureLiterature(true)" :disabled="litState.busy">
+              {{ litState.busy ? '检索中…' : '重新检索' }}
+            </button>
+            <button class="btn btn-ghost btn-sm" @click="openExport('literature')"
+                    :disabled="!litState.data">导出 Markdown</button>
+            <span class="lit-hint" v-if="litState.data">
+              {{ litState.fromCache ? '本地缓存' : '刚刚抓取' }} · {{ litState.data.generatedAt }}
+            </span>
+          </div>
+
+          <p class="lit-disclaimer">
+            下面每一类都由 Crossref + OpenAlex 接口自动检索，<strong>推荐理由是机器生成的可核验依据</strong>
+            （同作者、同机构、被本文引用、同主题高被引、引用本文），未经人工润色。
+            条目按各类别的信号强度排序，不代表重要程度。
+          </p>
+
+          <div class="busy-box" v-if="litState.busy">
+            <div class="loading-spinner"></div>
+            <p>{{ litState.stage || '正在检索…' }}</p>
+          </div>
+
+          <div class="warn-box" v-if="litState.error">{{ litState.error }}</div>
+
+          <template v-if="litState.data">
+
+            <!-- 作者画像：判断这个团队主要在做什么方向 -->
+            <div class="detail-section" v-if="litState.data.authorProfiles.length">
+              <h3>作者画像</h3>
+              <div class="profile-card" v-for="p in litState.data.authorProfiles" :key="p.name + p.position">
+                <div class="profile-head">
+                  <span class="profile-name">{{ p.name }}</span>
+                  <span class="profile-pos">
+                    {{ p.position === 'last' ? '末位/通讯作者' : p.position === 'first' ? '第一作者' : '作者' }}
+                  </span>
+                </div>
+                <div class="profile-stats">
+                  论文 {{ p.works_count }} 篇 · 总被引 {{ p.cited_by_count }}
+                  <template v-if="p.h_index !== null"> · h 指数 {{ p.h_index }}</template>
+                  <template v-if="p.i10_index !== null"> · i10 {{ p.i10_index }}</template>
+                </div>
+                <div class="profile-inst" v-if="p.institutions && p.institutions.length">
+                  {{ p.institutions.join('、') }}
+                </div>
+                <div class="chip-row" v-if="p.top_topics && p.top_topics.length">
+                  <span class="chip chip-topic" v-for="t in p.top_topics" :key="t.name">
+                    {{ t.name }} <i>{{ t.count }}</i>
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 五类推荐 -->
+            <div class="detail-section" v-for="c in litState.data.categories" :key="c.id">
+              <h3>{{ c.label }} <span class="count-pill">{{ c.items.length }}</span></h3>
+
+              <div class="warn-box" v-if="c.error">这一类检索失败：{{ c.error }}</div>
+              <p class="empty-hint" v-else-if="!c.items.length">
+                没有结果（可能是这篇论文太新还没被索引，或者这个信号在接口里查不到）
+              </p>
+
+              <div class="lit-card" v-for="(it, i) in c.items" :key="it.link + i">
+                <div class="lit-head">
+                  <a class="lit-title" :href="it.link" target="_blank" rel="noopener noreferrer">
+                    {{ i + 1 }}. {{ it.title }} <span class="ext-icon">↗</span>
+                  </a>
+                  <span class="badge badge-oa" v-if="it.is_oa">开放获取</span>
+                </div>
+                <div class="lit-meta">
+                  <span v-if="it.venue">{{ it.venue }}</span>
+                  <span v-if="it.year">{{ it.year }}</span>
+                  <span>被引 {{ it.cited_by_count }}</span>
+                  <a v-if="it.oa_url" :href="it.oa_url" target="_blank" rel="noopener noreferrer">免费全文 ↗</a>
+                </div>
+                <div class="lit-authors" v-if="it.authors_short">{{ it.authors_short }}</div>
+                <p class="lit-desc" v-if="it.description">{{ it.description }}</p>
+                <div class="lit-reason"><strong>推荐理由：</strong>{{ it.reason }}</div>
+              </div>
+            </div>
+          </template>
+
+          <!-- 没有 DOI 的论文（例如人工策划的那篇老示例）走到这里 -->
+          <div class="empty-state" v-if="!litState.busy && !litState.data && !litState.error">
+            <div class="empty-icon">📚</div>
+            <h2>还没有检索结果</h2>
+            <p>点上面的「重新检索」开始</p>
+          </div>
+        </div>
+      </aside>
+    </main>
+
+    <!-- ===== 导出弹窗 ===== -->
+    <div class="modal-mask" v-if="exportState.open" @click.self="exportState.open = false">
+      <div class="modal">
+        <div class="modal-head">
+          <h2>{{ exportState.title }}</h2>
+          <button class="close-btn" @click="exportState.open = false">×</button>
+        </div>
+        <textarea id="export-text" class="modal-text" readonly spellcheck="false"
+                  :value="exportState.text"></textarea>
+        <div class="modal-foot">
+          <span class="copied-hint" v-if="exportState.copied">已复制到剪贴板</span>
+          <span class="modal-hint">全选文本框内容即可复制</span>
+          <button class="btn btn-primary btn-sm" @click="copyExport">复制全文</button>
+          <button class="btn btn-ghost btn-sm" @click="exportState.open = false">关闭</button>
+        </div>
+      </div>
+    </div>
+
+    </template>
+  </div>
+
+  <!-- ===== 脚本：顺序有依赖，别调换 ===== -->
+  <!-- 1. 全局配置（所有可调参数） -->
+  <script src="js/config.js"></script>
+  <!-- 2. 数据层：两个领域的知识点池 + 论文库 + 示意图 + 资源链接覆盖层 -->
+  <script src="data/nodes-ic-device.js"></script>
+  <script src="data/nodes-power-wbg.js"></script>
+  <script src="data/papers.js"></script>
+  <script src="data/diagrams.js"></script>
+  <script src="data/resource_urls.js"></script>
+  <!-- 3. 功能模块 -->
+  <script src="js/store.js"></script>
+  <script src="js/pathgen.js"></script>
+  <script src="js/literature.js"></script>
+  <script src="js/autogen.js"></script>
+  <!-- 4. 界面（最后加载，前面所有东西都要就位） -->
+  <script src="js/app.js"></script>
+</body>
+</html>

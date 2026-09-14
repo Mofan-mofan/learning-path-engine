@@ -1,0 +1,8 @@
+# 交付物导出件，不进仓库：md 是权威源，PDF 只是本地阅读用
+*.pdf
+app.zip
+
+# 本地环境产物
+__pycache__/
+Thumbs.db
+desktop.ini
