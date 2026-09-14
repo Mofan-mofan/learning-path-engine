@@ -120,7 +120,7 @@ window.APP_CONFIG = {
     //     要用 primary_topic.id 才准
     //   · institutions.lineage 过滤 —— 接口直接返回 400
     //   · 单用 author.id 不过滤主题 —— OpenAlex 的作者消歧不准，
-    //     贾仁需的 112 篇里混进了钙钛矿、电化学传感器等无关论文
+    //     同一作者名下的 112 篇里混进了钙钛矿、电化学传感器等无关论文
     //   · 从标题里截前 N 个实词当检索词 —— 截到的是 Static/Dynamic/
     //     Performance/Medium-Voltage/V-6500，真正有信息量的 Ga2O3/SiC/
     //     Planar/Gate/MOSFETs 排在后面被截掉了，实测只命中本文自己
